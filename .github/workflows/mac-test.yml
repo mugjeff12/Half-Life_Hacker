@@ -1,0 +1,65 @@
+name: Mac test (zip, as students get it)
+
+# Actions -> "Mac test" -> Run workflow.   Manual only; it does NOT replace "Build executables".
+# On real macOS runners (Apple Silicon + Intel) it builds the app, then tests the ZIP the way a student
+# receives it: unzip -> add the download "quarantine" flag -> run the app's self-test -> screenshot every step.
+# Screenshots + the log are uploaded as an artifact so you can eyeball them. (Gatekeeper's "Open Anyway"
+# prompt and Retina rendering still need one real Mac - see the Gatekeeper step below, it is informational.)
+on:
+  workflow_dispatch:
+
+jobs:
+  mac-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   label: macOS-AppleSilicon, arch: arm64 }
+          - { os: macos-15-intel, label: macOS-Intel,        arch: x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt pyinstaller
+
+      - name: Build the app (build.py also self-tests the raw .app)
+        run: python build.py --test
+
+      - name: Unzip it like a student (ditto) and flag it as downloaded
+        run: |
+          set -e
+          mkdir -p student && cd student
+          ditto -x -k ../dist/HalfLifeHacker-macOS.zip .
+          xattr -w com.apple.quarantine "0081;$(printf '%x' $(date +%s));Safari;" HalfLifeHacker.app
+          ls -la HalfLifeHacker.app/Contents/MacOS
+          echo "--- architecture (expected: ${{ matrix.arch }}) ---"
+          file HalfLifeHacker.app/Contents/MacOS/HalfLifeHacker
+          lipo -archs HalfLifeHacker.app/Contents/MacOS/HalfLifeHacker | tee arch.txt
+          grep -qw "${{ matrix.arch }}" arch.txt || { echo "WRONG ARCHITECTURE"; exit 1; }
+          test -x HalfLifeHacker.app/Contents/MacOS/HalfLifeHacker || { echo "executable bit lost in zip"; exit 1; }
+
+      - name: Self-test the unzipped app + screenshot every step
+        run: |
+          set -e
+          mkdir -p shots
+          rm -f "${TMPDIR:-/tmp}/hlh_selftest.log"
+          QT_QPA_PLATFORM=offscreen student/HalfLifeHacker.app/Contents/MacOS/HalfLifeHacker \
+            --selftest --shots shots --size 1280x800
+          ls shots | wc -l
+
+      - name: Gatekeeper verdict (informational - an unsigned app is expected to be rejected)
+        continue-on-error: true
+        run: |
+          spctl --assess --type execute --verbose=4 student/HalfLifeHacker.app || true
+          codesign -dv student/HalfLifeHacker.app 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-test-${{ matrix.label }}
+          path: |
+            shots/
+            student/arch.txt
